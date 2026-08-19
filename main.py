@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import sys
@@ -12,15 +11,15 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterator, Sequence
 
-import aiohttp
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 
-GATEWAY_URL = "wss://gateway.discord.gg/?v=9&encoding=json"
 SCIENCE_URL = "https://discord.com/api/v9/science"
-GAMES_CDN_URL = "https://cdn.discordapp.com/detectables/games.json" 
+ME_URL = "https://discord.com/api/v9/users/@me?with_analytics_token=true"
+PROPERTIES_URL = "https://cordapi.dolfi.es/api/v2/properties/windows"
+GAMES_CDN_URL = "https://cdn.discordapp.com/detectables/games.json"
 
 BATCH_SIZE = 50
 BATCH_DELAY = 0.3
@@ -37,6 +36,16 @@ USER_AGENT = (
 )
 
 
+def _user_id_from_token(token: str) -> str:
+    """decode user id from the first segment of a discord token."""
+    try:
+        first = token.split(".", 1)[0]
+        pad = "=" * (-len(first) % 4)
+        return base64.b64decode(first + pad).decode("utf-8")
+    except Exception:
+        return ""
+
+
 class Console:
     """colored console output."""
 
@@ -50,6 +59,10 @@ class Console:
     RULE = "─" * 60
 
     def __init__(self) -> None:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
         if sys.platform == "win32":
             try:
                 self._enable_ansi()
@@ -191,72 +204,72 @@ class State:
         return bool(self.token.strip())
 
 
-def build_super_props(launch_signature: str, heartbeat_session: str) -> str:
-    props = {
-        "os": "Windows",
-        "browser": "Discord Client",
-        "release_channel": "stable",
-        "client_version": CLIENT_VERSION,
-        "os_version": OS_VERSION,
-        "os_arch": "x64",
-        "app_arch": "x64",
-        "system_locale": "en-GB",
-        "has_client_mods": False,
-        "client_launch_id": str(uuid.uuid4()),
-        "browser_user_agent": USER_AGENT,
-        "browser_version": "42.7.1",
-        "os_sdk_version": "26200",
-        "client_build_number": CLIENT_BUILD_NUMBER,
-        "native_build_number": NATIVE_BUILD_NUMBER,
-        "client_event_source": None,
-        "launch_signature": launch_signature,
-        "client_heartbeat_session_id": heartbeat_session,
-        "client_app_state": "focused",
+def _local_props() -> dict:
+    return {
+        "os": "Windows", "browser": "Discord Client", "release_channel": "stable",
+        "client_version": CLIENT_VERSION, "os_version": OS_VERSION,
+        "os_arch": "x64", "app_arch": "x64", "system_locale": "en-GB",
+        "has_client_mods": False, "browser_user_agent": USER_AGENT,
+        "browser_version": "42.7.1", "os_sdk_version": "26200",
+        "client_build_number": CLIENT_BUILD_NUMBER, "native_build_number": NATIVE_BUILD_NUMBER,
+        "client_event_source": None, "client_app_state": "focused",
     }
+
+
+def build_super_props(launch_signature: str, heartbeat_session: str) -> str:
+    try:
+        req = urllib.request.Request(PROPERTIES_URL, method="POST", data=b"{}",
+                                     headers={"content-type": "application/json", "user-agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            props = json.loads(resp.read().decode("utf-8"))["properties"]
+    except Exception:
+        props = _local_props()
+    props["client_launch_id"] = str(uuid.uuid4())
+    props["launch_signature"] = launch_signature
+    props["client_heartbeat_session_id"] = heartbeat_session
     raw = json.dumps(props, separators=(",", ":")).encode("utf-8")
     return base64.b64encode(raw).decode("ascii")
 
 
-async def _read_analytics_token(auth_token: str) -> str:
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(GATEWAY_URL, max_msg_size=0) as ws:
-            await ws.receive_json()
-            await ws.send_json({
-                "op": 2,
-                "d": {
-                    "token": auth_token,
-                    "capabilities": 30717,
-                    "properties": {
-                        "os": "Windows",
-                        "browser": "Discord Client",
-                        "release_channel": "stable",
-                        "client_version": CLIENT_VERSION,
-                        "os_version": OS_VERSION,
-                        "system_locale": "en-GB",
-                    },
-                },
-            })
-            async for msg in ws:
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
-                data = json.loads(msg.data)
-                if data.get("op") == 9:
-                    raise RuntimeError("gateway rejected token (invalid session)")
-                if data.get("t") == "READY":
-                    token = data["d"].get("analytics_token")
-                    if not token:
-                        raise RuntimeError("READY payload had no analytics_token")
-                    return token
-    raise RuntimeError("gateway closed before READY")
+def _fetch_analytics_token(auth_token: str, super_props: str) -> str:
+    """fetch analytics token via REST — simpler than the gateway websocket."""
+    req = urllib.request.Request(ME_URL, headers={
+        "authorization": auth_token,
+        "user-agent": USER_AGENT,
+        "x-super-properties": super_props,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"token rejected ({exc.code})") from exc
+    token = data.get("analytics_token")
+    if not token:
+        raise RuntimeError("no analytics_token in /users/@me response")
+    return token
+
+
+@dataclass(frozen=True)
+class Session:
+    """per-run client identity — fresh uuids + super_props, never saved to disk."""
+    heartbeat_session: str
+    launch_signature: str
+    super_props: str
+
+    @classmethod
+    def new(cls) -> "Session":
+        hb = str(uuid.uuid4())
+        sig = str(uuid.uuid4())
+        return cls(hb, sig, build_super_props(sig, hb))
 
 
 def refresh_auth(state: State) -> None:
-    """grab a fresh analytics token and rebuild the bundle. leaves token + cookie alone."""
-    analytics_token = asyncio.run(_read_analytics_token(state.token))
-    state.analytics_token = analytics_token
-    state.heartbeat_session = str(uuid.uuid4())
-    state.launch_signature = str(uuid.uuid4())
-    state.super_props = build_super_props(state.launch_signature, state.heartbeat_session)
+    """build a fresh session and cache the analytics token."""
+    session = Session.new()
+    state.heartbeat_session = session.heartbeat_session
+    state.launch_signature = session.launch_signature
+    state.super_props = session.super_props
+    state.analytics_token = _fetch_analytics_token(state.token, session.super_props)
     state.fetched_at = int(time.time())
     state.save()
 
