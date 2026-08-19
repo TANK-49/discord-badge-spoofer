@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
 import sys
 import time
 import uuid
@@ -34,6 +35,24 @@ USER_AGENT = (
     "(KHTML, like Gecko) discord/1.0.9253 Chrome/148.0.7778.280 "
     "Electron/42.7.1 Safari/537.36"
 )
+
+
+def _check_for_updates() -> None:
+    """silently pull the latest version from git and notify if updated."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "pull"],
+            capture_output=True, text=True, timeout=10
+        )
+        up_to_date = (
+            "Already up to date." in result.stdout
+            or "Already up-to-date." in result.stdout
+        )
+        if not up_to_date and result.returncode == 0 and result.stdout.strip():
+            print("\x1b[92m[+] Updated to the latest version! Please restart. | tm el-ta7deeth! 3awed el-tashgheel.\x1b[0m")
+            sys.exit(0)
+    except Exception:
+        pass
 
 
 def _user_id_from_token(token: str) -> str:
@@ -626,6 +645,7 @@ class App:
 
 
 def main() -> None:
+    _check_for_updates()
     try:
         App().start()
     except KeyboardInterrupt:
